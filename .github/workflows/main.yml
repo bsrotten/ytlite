@@ -1,4 +1,4 @@
-name: Create-YouTube-Plus-App
+name: Create YouTube Plus app
 
 on:
   workflow_dispatch:
@@ -15,6 +15,16 @@ on:
         default: false
       enable_yq:
         description: "Integrate YouQuality"
+        type: boolean
+        required: true
+        default: false
+      enable_ryd:
+        description: "Integrate Return YouTube Dislikes"
+        type: boolean
+        required: true
+        default: false
+      enable_demc:
+        description: "Integrate DontEatMyContent"
         type: boolean
         required: true
         default: false
@@ -85,6 +95,7 @@ jobs:
       - name: Install gdown (Google Drive downloader)
         run: |
           pipx install --force gdown
+          pipx inject gdown lxml
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Download and validate IPA
@@ -101,15 +112,7 @@ jobs:
 
           if [[ "$URL" =~ drive.google.com ]]; then
             echo "Detected Google Drive URL."
-            if [[ "$URL" =~ /file/d/([^/]+)/ ]]; then
-              FILEID="${BASH_REMATCH[1]}"
-            elif [[ "$URL" =~ id=([^&]+) ]]; then
-              FILEID="${BASH_REMATCH[1]}"
-            else
-              echo "::error::Could not extract Google Drive file id from URL."
-              exit 1
-            fi
-            gdown --fuzzy --no-cookies --id "$FILEID" -O "$OUT"
+            gdown --fuzzy "$URL" -O "$OUT"
           else
             curl -L --fail --retry 3 --retry-delay 2 \
               -A "GitHubActions/1.0 (+https://github.com)" \
@@ -148,8 +151,6 @@ jobs:
 
           echo "IPA structure (first 50 lines):"
           unzip -l "$OUT" | head -n 50
-
-          # Pass to later steps
           echo "IPA_IN=$OUT" >> "$GITHUB_ENV"
 
       - name: Cache Theos
@@ -172,17 +173,6 @@ jobs:
           path: ${{ github.workspace }}/theos
           submodules: recursive
 
-      - name: Download iOS SDK
-        if: ${{ (inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_demc) && steps.theos.outputs.cache-hit != 'true' }}
-        env:
-          THEOS: ${{ github.workspace }}/theos
-        run: |
-          git clone --quiet -n --depth=1 --filter=tree:0 https://github.com/theos/sdks/
-          cd sdks
-          git sparse-checkout set --no-cone iPhoneOS16.5.sdk
-          git checkout
-          mv *.sdk "$THEOS/sdks"
-
       - name: Download YouTube Plus (YTLite)
         id: download_ytp
         run: |
@@ -197,45 +187,6 @@ jobs:
           git sparse-checkout set --no-cone OpenYoutubeSafariExtension.appex
           git checkout
           mv *.appex "${{ github.workspace }}"
-
-      - name: "(Optional) Headers and extra tweak repos"
-        if: ${{ inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_demc }}
-        env:
-          THEOS: ${{ github.workspace }}/theos
-        run: |
-          set -e
-          if [ ! -d "$THEOS/include/YouTubeHeader" ]; then
-            mkdir -p "$THEOS/include"
-            git -C "$THEOS/include" clone --quiet --depth=1 https://github.com/PoomSmart/YouTubeHeader.git
-          else
-            git -C "$THEOS/include/YouTubeHeader" pull
-          fi
-          if [ ! -d "$THEOS/include/PSHeader" ]; then
-            git -C "$THEOS/include" clone --quiet --depth=1 https://github.com/PoomSmart/PSHeader.git
-          else
-            git -C "$THEOS/include/PSHeader" pull
-          fi
-          cd "${{ github.workspace }}"
-          [[ "${{ inputs.enable_youpip }}" == "true" ]] && git clone --quiet --depth=1 https://github.com/PoomSmart/YouPiP.git || true
-          [[ "${{ inputs.enable_ytuhd }}" == "true" ]] && git clone --quiet --depth=1 https://github.com/PoomSmart/YTUHD.git || true
-          [[ "${{ inputs.enable_ryd }}" == "true" ]] && git clone --quiet --depth=1 https://github.com/PoomSmart/Return-YouTube-Dislikes.git || true
-          [[ "${{ inputs.enable_demc }}" == "true" ]] && git clone --quiet --recurse-submodules --depth=1 https://github.com/therealFoxster/DontEatMyContent.git || true
-          [[ "${{ inputs.enable_yq }}" == "true" || "${{ inputs.enable_youpip }}" == "true" ]] && git clone --quiet --depth=1 https://github.com/PoomSmart/YTVideoOverlay.git || true
-          [[ "${{ inputs.enable_yq }}" == "true" ]] && git clone --quiet --depth=1 https://github.com/PoomSmart/YouQuality.git || true
-
-      - name: "(Optional) Build extra tweaks"
-        if: ${{ inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_demc }}
-        env:
-          THEOS: ${{ github.workspace }}/theos
-        run: |
-          set -e
-          build_deb () { cd "$1"; make clean package DEBUG=0 FINALPACKAGE=1; mv packages/*.deb "${{ github.workspace }}/$2"; cd - >/dev/null; }
-          [[ "${{ inputs.enable_youpip }}" == "true" ]] && build_deb "${{ github.workspace }}/YouPiP" youpip.deb || true
-          [[ "${{ inputs.enable_ytuhd }}" == "true" ]] && build_deb "${{ github.workspace }}/YTUHD" ytuhd.deb || true
-          [[ "${{ inputs.enable_ryd }}" == "true" ]] && build_deb "${{ github.workspace }}/Return-YouTube-Dislikes" ryd.deb || true
-          [[ "${{ inputs.enable_demc }}" == "true" ]] && build_deb "${{ github.workspace }}/DontEatMyContent" demc.deb || true
-          [[ "${{ inputs.enable_yq }}" == "true" ]] && build_deb "${{ github.workspace }}/YouQuality" yq.deb || true
-          [[ -d "${{ github.workspace }}/YTVideoOverlay" ]] && build_deb "${{ github.workspace }}/YTVideoOverlay" ytvo.deb || true
 
       - name: "Final sanity check: IPA has Payload/*.app"
         run: |
@@ -273,4 +224,4 @@ jobs:
           draft: true
 
       - name: Output Release URL
-        run: "echo '::notice::Release available at: https://github.com/${{ github.repository }}/releases'"
+        run: echo "::notice::Release available at: https://github.com/${{ github.repository }}/releases"
