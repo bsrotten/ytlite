@@ -214,4 +214,6 @@ jobs:
           draft: true
 
       - name: Output Release URL
-        run: echo "::notice::Release available at: https://github.com/${{ github.repository }}/releases"
+        shell: bash
+        run: |
+          echo "::notice::Release available at: https://github.com/${{ github.repository }}/releases"
