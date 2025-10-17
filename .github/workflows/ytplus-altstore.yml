@@ -1,0 +1,247 @@
+name: Build YouTube Plus (AltStore-ready)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "Direct URL to a *decrypted* device IPA (not Simulator, not App Store-encrypted)"
+        required: true
+        type: string
+      tweak_version:
+        description: "YTLite version from dayanch96/YTLite/releases (e.g., 5.2b3)"
+        default: "5.2b3"
+        required: true
+        type: string
+      display_name:
+        description: "App display name (optional)"
+        default: "YouTube"
+        required: true
+        type: string
+      bundle_id:
+        description: "Bundle ID (optional)"
+        default: "com.google.ios.youtube"
+        required: true
+        type: string
+      enable_youpip:
+        description: "Integrate YouPiP"
+        type: boolean
+        default: false
+        required: true
+      enable_ytuhd:
+        description: "Integrate YTUHD"
+        type: boolean
+        default: false
+        required: true
+      enable_yq:
+        description: "Integrate YouQuality"
+        type: boolean
+        default: false
+        required: true
+      enable_ryd:
+        description: "Integrate Return YouTube Dislikes"
+        type: boolean
+        default: false
+        required: true
+      enable_demc:
+        description: "Integrate DontEatMyContent"
+        type: boolean
+        default: false
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: main
+          submodules: recursive
+
+      - name: Hide non-sensitive inputs in logs
+        uses: levibostian/action-hide-sensitive-inputs@v1
+        with:
+          exclude_inputs: bundle_id,display_name,enable_demc,enable_ryd,enable_youpip,enable_yq,enable_ytuhd,tweak_version
+
+      - name: Install dependencies (brew)
+        run: |
+          brew install make ldid
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Install cyan (IPA tweak injector) and add to PATH
+        run: |
+          pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Download base IPA (decrypted) and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 3 --retry-delay 2 \
+            -A "GitHubActions/1.0 (+https://github.com)" \
+            -o "$GITHUB_WORKSPACE/youtube.ipa" \
+            "${{ inputs.ipa_url }}"
+
+          echo "Downloaded file:"
+          ls -lah "$GITHUB_WORKSPACE/youtube.ipa"
+          mime="$(file --mime-type -b "$GITHUB_WORKSPACE/youtube.ipa" || true)"
+          if [[ "$mime" == "text/html" || "$mime" == "text/plain" ]]; then
+            echo "::error::The URL returned $mime (likely a preview/sign-in page). Provide a direct IPA file link."
+            exit 1
+          fi
+
+          # Check for Payload/… .app
+          if ! unzip -l "$GITHUB_WORKSPACE/youtube.ipa" >/tmp/ziplist.txt 2>/dev/null; then
+            echo "::error::Not a valid ZIP/IPA or the file is corrupted."
+            exit 1
+          fi
+
+          if ! grep -qE ' Payload/[^/]+\.app/' /tmp/ziplist.txt; then
+            echo "::warning::No Payload/*.app found. Attempting repack if this is a zipped .app bundle…"
+            tmpdir="$(mktemp -d)"
+            unzip -q "$GITHUB_WORKSPACE/youtube.ipa" -d "$tmpdir" || true
+            appdir="$(find "$tmpdir" -maxdepth 2 -type d -name '*.app' | head -n 1 || true)"
+            if [[ -n "${appdir:-}" ]]; then
+              echo "Found app bundle at: $appdir; repacking into proper IPA."
+              rpdir="$(mktemp -d)"
+              mkdir -p "$rpdir/Payload"
+              rsync -a "$appdir" "$rpdir/Payload/"
+              (cd "$rpdir" && zip -qry "$GITHUB_WORKSPACE/youtube.ipa" Payload)
+            else
+              echo "::error::Invalid input: no Payload/*.app and no .app bundle to repack. Provide a *decrypted device IPA* (not Simulator)."
+              exit 1
+            fi
+          fi
+
+          echo "IPA structure (first 50 lines):"
+          unzip -l "$GITHUB_WORKSPACE/youtube.ipa" | head -n 50
+
+      # Optional Theos cache if you enable building extra tweaks
+      - name: Cache Theos
+        if: ${{ inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_demc }}
+        id: theos
+        uses: actions/cache@v4
+        env:
+          cache-name: theos_cache_67db2ab
+        with:
+          path: theos/
+          key: ${{ env.cache-name }}
+          restore-keys: ${{ env.cache-name }}
+
+      - name: Setup Theos (when needed)
+        if: ${{ (inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_demc) && steps.theos.outputs.cache-hit != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          ref: 67db2ab8d950910161730de77c322658ea3e6b44
+          path: ${{ github.workspace }}/theos
+          submodules: recursive
+
+      - name: Download iOS SDK for Theos (when needed)
+        if: ${{ (inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_demc) && steps.theos.outputs.cache-hit != 'true' }}
+        run: |
+          git clone --quiet -n --depth=1 --filter=tree:0 https://github.com/theos/sdks/
+          cd sdks
+          git sparse-checkout set --no-cone iPhoneOS16.5.sdk
+          git checkout
+          mv *.sdk "$THEOS/sdks"
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Download YTLite deb
+        run: |
+          deb_url="https://github.com/dayanch96/YTLite/releases/download/v${{ inputs.tweak_version }}/com.dvntm.ytlite_${{ inputs.tweak_version }}_iphoneos-arm.deb"
+          echo "Fetching: $deb_url"
+          curl -L --fail --retry 3 --retry-delay 2 -o "$GITHUB_WORKSPACE/ytplus.deb" "$deb_url"
+
+      - name: Fetch Open in YouTube (Safari extension)
+        run: |
+          git clone --quiet -n --depth=1 --filter=tree:0 https://github.com/CokePokes/YoutubeExtensions/
+          cd YoutubeExtensions
+          git sparse-checkout set --no-cone OpenYoutubeSafariExtension.appex
+          git checkout
+          mv *.appex "$GITHUB_WORKSPACE"
+
+      - name: (Optional) Headers & extra tweak repos
+        if: ${{ inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_demc }}
+        run: |
+          set -e
+          # Headers
+          if [ ! -d "$THEOS/include/YouTubeHeader" ]; then
+            mkdir -p "$THEOS/include"
+            git -C "$THEOS/include" clone --quiet --depth=1 https://github.com/PoomSmart/YouTubeHeader.git
+          else
+            git -C "$THEOS/include/YouTubeHeader" pull
+          fi
+          if [ ! -d "$THEOS/include/PSHeader" ]; then
+            git -C "$THEOS/include" clone --quiet --depth=1 https://github.com/PoomSmart/PSHeader.git
+          else
+            git -C "$THEOS/include/PSHeader" pull
+          fi
+          # Extra tweaks (shallow)
+          cd "$GITHUB_WORKSPACE"
+          if ${{ inputs.enable_youpip }}; then git clone --quiet --depth=1 https://github.com/PoomSmart/YouPiP.git; fi
+          if ${{ inputs.enable_ytuhd }}; then git clone --quiet --depth=1 https://github.com/PoomSmart/YTUHD.git; fi
+          if ${{ inputs.enable_ryd }}; then git clone --quiet --depth=1 https://github.com/PoomSmart/Return-YouTube-Dislikes.git; fi
+          if ${{ inputs.enable_demc }}; then git clone --quiet --recurse-submodules --depth=1 https://github.com/therealFoxster/DontEatMyContent.git; fi
+          if ${{ inputs.enable_yq || inputs.enable_youpip }}; then git clone --quiet --depth=1 https://github.com/PoomSmart/YTVideoOverlay.git; fi
+          if ${{ inputs.enable_yq }}; then git clone --quiet --depth=1 https://github.com/PoomSmart/YouQuality.git; fi
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: (Optional) Build extra tweaks
+        if: ${{ inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_demc }}
+        run: |
+          set -e
+          build_deb () { cd "$1"; make clean package DEBUG=0 FINALPACKAGE=1; mv packages/*.deb "$GITHUB_WORKSPACE/$2"; cd - >/dev/null; }
+          [[ "${{ inputs.enable_youpip }}" == "true" ]] && build_deb "$GITHUB_WORKSPACE/YouPiP" youpip.deb || true
+          [[ "${{ inputs.enable_ytuhd }}" == "true" ]] && build_deb "$GITHUB_WORKSPACE/YTUHD" ytuhd.deb || true
+          [[ "${{ inputs.enable_ryd }}" == "true" ]] && build_deb "$GITHUB_WORKSPACE/Return-YouTube-Dislikes" ryd.deb || true
+          [[ "${{ inputs.enable_demc }}" == "true" ]] && build_deb "$GITHUB_WORKSPACE/DontEatMyContent" demc.deb || true
+          [[ "${{ inputs.enable_yq }}" == "true" ]] && build_deb "$GITHUB_WORKSPACE/YouQuality" yq.deb || true
+          # YTVideoOverlay is a dependency for some tweaks; build if its repo exists
+          [[ -d "$GITHUB_WORKSPACE/YTVideoOverlay" ]] && build_deb "$GITHUB_WORKSPACE/YTVideoOverlay" ytvo.deb || true
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Final sanity check: IPA has Payload/*.app
+        run: |
+          set -euo pipefail
+          if ! unzip -l "$GITHUB_WORKSPACE/youtube.ipa" | grep -qE ' Payload/[^/]+\.app/'; then
+            echo "::error::youtube.ipa lacks Payload/*.app — provide a decrypted device IPA (not Simulator)."
+            exit 1
+          fi
+
+      - name: Inject tweaks (no signing; AltStore-ready)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tweaks="ytplus.deb OpenYoutubeSafariExtension.appex"
+          for f in "$GITHUB_WORKSPACE"/*.deb; do
+            [[ -f "$f" && "$f" != *"ytplus.deb" ]] && tweaks="$tweaks $f"
+          done
+
+          echo "Injecting into youtube.ipa"
+          echo "Tweaks: $tweaks"
+          cyan -i "$GITHUB_WORKSPACE/youtube.ipa" \
+               -o "YouTubePlus_${{ inputs.tweak_version }}.ipa" \
+               -uwef $tweaks \
+               -n "${{ inputs.display_name }}" \
+               -b "${{ inputs.bundle_id }}"
+
+          echo "Output:"
+          ls -lah "YouTubePlus_${{ inputs.tweak_version }}.ipa"
+
+      - name: Upload artifact (AltStore-ready IPA)
+        uses: actions/upload-artifact@v4
+        with:
+          name: YouTubePlus-${{ inputs.tweak_version }}-AltStore
+          path: YouTubePlus_${{ inputs.tweak_version }}.ipa
+          if-no-files-found: error
