@@ -29,9 +29,14 @@ on:
         required: true
         default: false
       ipa_url:
-        description: "URL to the decrypted IPA file"
+        description: "URL to the decrypted IPA file (direct link or Google Drive share link)"
         default: ""
         required: true
+        type: string
+      file_name:
+        description: "Custom filename for the downloaded IPA (must end with .ipa)"
+        default: "youtube.ipa"
+        required: false
         type: string
       tweak_version:
         description: "Version from dayanch96/YTLite/releases (e.g., 5.2b3)"
@@ -77,57 +82,6 @@ jobs:
         with:
           exclude_inputs: "bundle_id,display_name,enable_demc,enable_ryd,enable_youpip,enable_yq,enable_ytuhd,info_note,tweak_version"
 
-      - name: Download and validate IPA
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Download (follow redirects, fail on HTTP errors)
-          curl -L --fail --retry 3 --retry-delay 2 \
-            -A "GitHubActions/1.0 (+https://github.com)" \
-            -o "$GITHUB_WORKSPACE/youtube.ipa" \
-            "${{ inputs.ipa_url }}"
-
-          echo "Downloaded file info:"
-          ls -lah "$GITHUB_WORKSPACE/youtube.ipa"
-          file "$GITHUB_WORKSPACE/youtube.ipa" || true
-          mime="$(file --mime-type -b "$GITHUB_WORKSPACE/youtube.ipa")"
-
-          # Sometimes you get HTML instead of the file
-          if [[ "$mime" == "text/html" || "$mime" == "text/plain" ]]; then
-            echo "::error::The URL returned $mime (likely a sign-in wall or bad link). Provide a direct IPA link."
-            exit 1
-          fi
-
-          # Validate ZIP structure
-          if ! unzip -l "$GITHUB_WORKSPACE/youtube.ipa" >/tmp/ziplist.txt 2>/dev/null; then
-            echo "::error::File is not a ZIP/IPA or is corrupted."
-            exit 1
-          fi
-
-          head -n 50 /tmp/ziplist.txt || true
-
-          # Ensure Payload/*.app exists; try repack if a bare .app was zipped
-          if ! grep -qE ' Payload/[^/]+\.app/' /tmp/ziplist.txt; then
-            echo "::warning::No Payload/*.app found. Attempting auto-repack if this is a zipped .app…"
-            tmpdir="$(mktemp -d)"
-            unzip -q "$GITHUB_WORKSPACE/youtube.ipa" -d "$tmpdir" || true
-            appdir="$(find "$tmpdir" -maxdepth 2 -type d -name '*.app' | head -n 1 || true)"
-            if [[ -n "${appdir:-}" ]]; then
-              echo "Found app bundle at: $appdir"
-              rpdir="$(mktemp -d)"
-              mkdir -p "$rpdir/Payload"
-              rsync -a "$appdir" "$rpdir/Payload/"
-              (cd "$rpdir" && zip -qry "$GITHUB_WORKSPACE/youtube.ipa" Payload)
-              echo "Repacked as a proper IPA with Payload/."
-            else
-              echo "::error::Invalid IPA: no Payload/ and no .app bundle to repack. Provide a decrypted device IPA (not Simulator)."
-              exit 1
-            fi
-          fi
-
-          echo "Final IPA structure (first 50 lines):"
-          unzip -l "$GITHUB_WORKSPACE/youtube.ipa" | head -n 50
-
       - name: Install Dependencies
         run: |
           brew install make ldid
@@ -137,6 +91,76 @@ jobs:
         run: |
           pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install gdown (Google Drive downloader)
+        run: |
+          pipx install --force gdown
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Download and validate IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="${{ inputs.ipa_url }}"
+          NAME="${{ inputs.file_name }}"
+          [[ "$NAME" != *.ipa ]] && NAME="${NAME}.ipa"
+          OUT="$GITHUB_WORKSPACE/$NAME"
+
+          echo "Requested URL: $URL"
+          echo "Target file:   $OUT"
+
+          if [[ "$URL" =~ drive.google.com ]]; then
+            echo "Detected Google Drive URL."
+            if [[ "$URL" =~ /file/d/([^/]+)/ ]]; then
+              FILEID="${BASH_REMATCH[1]}"
+            elif [[ "$URL" =~ id=([^&]+) ]]; then
+              FILEID="${BASH_REMATCH[1]}"
+            else
+              echo "::error::Could not extract Google Drive file id from URL."
+              exit 1
+            fi
+            gdown --fuzzy --no-cookies --id "$FILEID" -O "$OUT"
+          else
+            curl -L --fail --retry 3 --retry-delay 2 \
+              -A "GitHubActions/1.0 (+https://github.com)" \
+              -o "$OUT" "$URL"
+          fi
+
+          echo "Downloaded file:"
+          ls -lah "$OUT"
+          mime="$(file --mime-type -b "$OUT" || true)"
+          if [[ "$mime" == "text/html" || "$mime" == "text/plain" ]]; then
+            echo "::error::The URL returned $mime (preview/sign-in page). Ensure sharing is 'Anyone with the link' and use a direct file link."
+            exit 1
+          fi
+
+          if ! unzip -l "$OUT" >/tmp/ziplist.txt 2>/dev/null; then
+            echo "::error::Not a valid ZIP/IPA or file is corrupted."
+            exit 1
+          fi
+
+          if ! grep -qE ' Payload/[^/]+\.app/' /tmp/ziplist.txt; then
+            echo "::warning::No Payload/*.app found. Attempting repack if this is a zipped .app bundle…"
+            tmpdir="$(mktemp -d)"
+            unzip -q "$OUT" -d "$tmpdir" || true
+            appdir="$(find "$tmpdir" -maxdepth 2 -type d -name '*.app' | head -n 1 || true)"
+            if [[ -n "${appdir:-}" ]]; then
+              rpdir="$(mktemp -d)"
+              mkdir -p "$rpdir/Payload"
+              rsync -a "$appdir" "$rpdir/Payload/"
+              (cd "$rpdir" && zip -qry "$OUT" Payload)
+              echo "Repacked into a proper IPA with Payload/."
+            else
+              echo "::error::Invalid input: no Payload/*.app and no .app bundle to repack. Provide a decrypted device IPA (not Simulator)."
+              exit 1
+            fi
+          fi
+
+          echo "IPA structure (first 50 lines):"
+          unzip -l "$OUT" | head -n 50
+
+          # Pass to later steps
+          echo "IPA_IN=$OUT" >> "$GITHUB_ENV"
 
       - name: Cache Theos
         if: ${{ inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_demc }}
@@ -184,150 +208,52 @@ jobs:
           git checkout
           mv *.appex "${{ github.workspace }}"
 
-      - name: Clone YouTubeHeader
+      - name: "(Optional) Headers and extra tweak repos"
         if: ${{ inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_demc }}
         env:
           THEOS: ${{ github.workspace }}/theos
         run: |
-          if [ -d "$THEOS/include/YouTubeHeader" ]; then
-            echo "YouTubeHeader exists. Pulling latest changes..."
-            cd "$THEOS/include/YouTubeHeader"
-            git pull
-          else
-            echo "YouTubeHeader does not exist. Cloning repository..."
+          set -e
+          if [ ! -d "$THEOS/include/YouTubeHeader" ]; then
             mkdir -p "$THEOS/include"
-            cd "$THEOS/include"
-            git clone --quiet --depth=1 https://github.com/PoomSmart/YouTubeHeader.git
+            git -C "$THEOS/include" clone --quiet --depth=1 https://github.com/PoomSmart/YouTubeHeader.git
+          else
+            git -C "$THEOS/include/YouTubeHeader" pull
           fi
-
-          if [ "${{ inputs.enable_demc }}" = "true" ]; then
-            echo "Copying YouTubeHeader to YTHeaders..."
-            rm -rf "$THEOS/include/YTHeaders"
-            cp -r "$THEOS/include/YouTubeHeader" "$THEOS/include/YTHeaders"
+          if [ ! -d "$THEOS/include/PSHeader" ]; then
+            git -C "$THEOS/include" clone --quiet --depth=1 https://github.com/PoomSmart/PSHeader.git
+          else
+            git -C "$THEOS/include/PSHeader" pull
           fi
+          cd "${{ github.workspace }}"
+          [[ "${{ inputs.enable_youpip }}" == "true" ]] && git clone --quiet --depth=1 https://github.com/PoomSmart/YouPiP.git || true
+          [[ "${{ inputs.enable_ytuhd }}" == "true" ]] && git clone --quiet --depth=1 https://github.com/PoomSmart/YTUHD.git || true
+          [[ "${{ inputs.enable_ryd }}" == "true" ]] && git clone --quiet --depth=1 https://github.com/PoomSmart/Return-YouTube-Dislikes.git || true
+          [[ "${{ inputs.enable_demc }}" == "true" ]] && git clone --quiet --recurse-submodules --depth=1 https://github.com/therealFoxster/DontEatMyContent.git || true
+          [[ "${{ inputs.enable_yq }}" == "true" || "${{ inputs.enable_youpip }}" == "true" ]] && git clone --quiet --depth=1 https://github.com/PoomSmart/YTVideoOverlay.git || true
+          [[ "${{ inputs.enable_yq }}" == "true" ]] && git clone --quiet --depth=1 https://github.com/PoomSmart/YouQuality.git || true
 
-      - name: Clone PSHeader
+      - name: "(Optional) Build extra tweaks"
         if: ${{ inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_demc }}
         env:
           THEOS: ${{ github.workspace }}/theos
         run: |
-          if [ -d "$THEOS/include/PSHeader" ]; then
-            echo "PSHeader exists. Pulling latest changes..."
-            cd "$THEOS/include/PSHeader"
-            git pull
-          else
-            echo "PSHeader does not exist. Cloning repository..."
-            mkdir -p "$THEOS/include"
-            cd "$THEOS/include"
-            git clone --quiet --depth=1 https://github.com/PoomSmart/PSHeader.git
+          set -e
+          build_deb () { cd "$1"; make clean package DEBUG=0 FINALPACKAGE=1; mv packages/*.deb "${{ github.workspace }}/$2"; cd - >/dev/null; }
+          [[ "${{ inputs.enable_youpip }}" == "true" ]] && build_deb "${{ github.workspace }}/YouPiP" youpip.deb || true
+          [[ "${{ inputs.enable_ytuhd }}" == "true" ]] && build_deb "${{ github.workspace }}/YTUHD" ytuhd.deb || true
+          [[ "${{ inputs.enable_ryd }}" == "true" ]] && build_deb "${{ github.workspace }}/Return-YouTube-Dislikes" ryd.deb || true
+          [[ "${{ inputs.enable_demc }}" == "true" ]] && build_deb "${{ github.workspace }}/DontEatMyContent" demc.deb || true
+          [[ "${{ inputs.enable_yq }}" == "true" ]] && build_deb "${{ github.workspace }}/YouQuality" yq.deb || true
+          [[ -d "${{ github.workspace }}/YTVideoOverlay" ]] && build_deb "${{ github.workspace }}/YTVideoOverlay" ytvo.deb || true
+
+      - name: "Final sanity check: IPA has Payload/*.app"
+        run: |
+          set -euo pipefail
+          if ! unzip -l "$IPA_IN" | grep -qE ' Payload/[^/]+\.app/'; then
+            echo "::error::$IPA_IN lacks Payload/*.app — provide a decrypted device IPA (not Simulator)."
+            exit 1
           fi
-
-      - name: Clone YouPiP
-        if: ${{ inputs.enable_youpip }}
-        run: |
-          cd "${{ github.workspace }}"
-          git clone --quiet --depth=1 https://github.com/PoomSmart/YouPiP.git
-
-      - name: Clone YTUHD
-        if: ${{ inputs.enable_ytuhd }}
-        uses: actions/checkout@v4
-        with:
-          repository: PoomSmart/YTUHD
-          ref: 0f59b38817d554ab692a0053456319847a6ab1a1
-          path: ${{ github.workspace }}/YTUHD
-
-      - name: Clone Return-YouTube-Dislikes
-        if: ${{ inputs.enable_ryd }}
-        run: |
-          cd "${{ github.workspace }}"
-          git clone --quiet --depth=1 https://github.com/PoomSmart/Return-YouTube-Dislikes.git
-
-      - name: Clone YouGroupSettings
-        if: ${{ inputs.enable_demc }}
-        run: |
-          cd "${{ github.workspace }}"
-          git clone --quiet --depth=1 https://github.com/PoomSmart/YouGroupSettings.git
-
-      - name: Clone YouQuality
-        if: ${{ inputs.enable_yq }}
-        run: |
-          cd "${{ github.workspace }}"
-          git clone --quiet --depth=1 https://github.com/PoomSmart/YouQuality.git
-
-      - name: Clone YTVideoOverlay
-        if: ${{ inputs.enable_yq || inputs.enable_youpip }}
-        run: |
-          cd "${{ github.workspace }}"
-          git clone --quiet --depth=1 https://github.com/PoomSmart/YTVideoOverlay.git
-
-      - name: Clone DontEatMyContent
-        if: ${{ inputs.enable_demc }}
-        run: |
-          cd "${{ github.workspace }}"
-          git clone --quiet --depth=1 --recurse-submodules https://github.com/therealFoxster/DontEatMyContent.git
-
-      - name: Build YouPiP
-        if: ${{ inputs.enable_youpip }}
-        env:
-          THEOS: ${{ github.workspace }}/theos
-        run: |
-          cd "${{ github.workspace }}/YouPiP"
-          make clean package DEBUG=0 FINALPACKAGE=1
-          mv packages/*.deb "${{ github.workspace }}/youpip.deb"
-
-      - name: Build YTUHD
-        if: ${{ inputs.enable_ytuhd }}
-        env:
-          THEOS: ${{ github.workspace }}/theos
-        run: |
-          cd "${{ github.workspace }}/YTUHD"
-          make clean package DEBUG=0 FINALPACKAGE=1
-          mv packages/*.deb "${{ github.workspace }}/ytuhd.deb"
-
-      - name: Build Return-YouTube-Dislikes
-        if: ${{ inputs.enable_ryd }}
-        env:
-          THEOS: ${{ github.workspace }}/theos
-        run: |
-          cd "${{ github.workspace }}/Return-YouTube-Dislikes"
-          make clean package DEBUG=0 FINALPACKAGE=1
-          mv packages/*.deb "${{ github.workspace }}/ryd.deb"
-
-      - name: Build YouGroupSettings
-        if: ${{ inputs.enable_demc }}
-        env:
-          THEOS: ${{ github.workspace }}/theos
-        run: |
-          cd "${{ github.workspace }}/YouGroupSettings"
-          make clean package DEBUG=0 FINALPACKAGE=1
-          mv packages/*.deb "${{ github.workspace }}/ygs.deb"
-
-      - name: Build YouQuality
-        if: ${{ inputs.enable_yq }}
-        env:
-          THEOS: ${{ github.workspace }}/theos
-        run: |
-          cd "${{ github.workspace }}/YouQuality"
-          make clean package DEBUG=0 FINALPACKAGE=1
-          mv packages/*.deb "${{ github.workspace }}/yq.deb"
-
-      - name: Build YTVideoOverlay
-        if: ${{ inputs.enable_yq || inputs.enable_youpip }}
-        env:
-          THEOS: ${{ github.workspace }}/theos
-        run: |
-          cd "${{ github.workspace }}/YTVideoOverlay"
-          make clean package DEBUG=0 FINALPACKAGE=1
-          mv packages/*.deb "${{ github.workspace }}/ytvo.deb"
-
-      - name: Build DontEatMyContent
-        if: ${{ inputs.enable_demc }}
-        env:
-          THEOS: ${{ github.workspace }}/theos
-        run: |
-          cd "${{ github.workspace }}/DontEatMyContent"
-          make clean package DEBUG=0 FINALPACKAGE=1
-          mv packages/*.deb "${{ github.workspace }}/demc.deb"
 
       - name: Inject tweaks into IPA
         shell: bash
@@ -339,12 +265,14 @@ jobs:
               tweaks="$tweaks $f"
             fi
           done
-          echo "Tweaks to inject: $tweaks"
-          cyan -i youtube.ipa \
+          echo "Input IPA: $IPA_IN"
+          echo "Tweaks: $tweaks"
+          cyan -i "$IPA_IN" \
                -o "YouTubePlus_${{ inputs.tweak_version }}.ipa" \
                -uwef $tweaks \
                -n "${{ inputs.display_name }}" \
                -b "${{ inputs.bundle_id }}"
+          ls -lah "YouTubePlus_${{ inputs.tweak_version }}.ipa"
 
       - name: Upload to GitHub Releases
         uses: softprops/action-gh-release@v2
