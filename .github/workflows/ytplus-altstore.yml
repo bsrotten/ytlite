@@ -97,7 +97,6 @@ jobs:
             exit 1
           fi
 
-          # Check for Payload/… .app
           if ! unzip -l "$GITHUB_WORKSPACE/youtube.ipa" >/tmp/ziplist.txt 2>/dev/null; then
             echo "::error::Not a valid ZIP/IPA or the file is corrupted."
             exit 1
@@ -123,7 +122,6 @@ jobs:
           echo "IPA structure (first 50 lines):"
           unzip -l "$GITHUB_WORKSPACE/youtube.ipa" | head -n 50
 
-      # Optional Theos cache if you enable building extra tweaks
       - name: Cache Theos
         if: ${{ inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_demc }}
         id: theos
@@ -169,11 +167,10 @@ jobs:
           git checkout
           mv *.appex "$GITHUB_WORKSPACE"
 
-      - name: (Optional) Headers & extra tweak repos
+      - name: "(Optional) Headers and extra tweak repos"
         if: ${{ inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_demc }}
         run: |
           set -e
-          # Headers
           if [ ! -d "$THEOS/include/YouTubeHeader" ]; then
             mkdir -p "$THEOS/include"
             git -C "$THEOS/include" clone --quiet --depth=1 https://github.com/PoomSmart/YouTubeHeader.git
@@ -185,18 +182,17 @@ jobs:
           else
             git -C "$THEOS/include/PSHeader" pull
           fi
-          # Extra tweaks (shallow)
           cd "$GITHUB_WORKSPACE"
-          if ${{ inputs.enable_youpip }}; then git clone --quiet --depth=1 https://github.com/PoomSmart/YouPiP.git; fi
-          if ${{ inputs.enable_ytuhd }}; then git clone --quiet --depth=1 https://github.com/PoomSmart/YTUHD.git; fi
-          if ${{ inputs.enable_ryd }}; then git clone --quiet --depth=1 https://github.com/PoomSmart/Return-YouTube-Dislikes.git; fi
-          if ${{ inputs.enable_demc }}; then git clone --quiet --recurse-submodules --depth=1 https://github.com/therealFoxster/DontEatMyContent.git; fi
-          if ${{ inputs.enable_yq || inputs.enable_youpip }}; then git clone --quiet --depth=1 https://github.com/PoomSmart/YTVideoOverlay.git; fi
-          if ${{ inputs.enable_yq }}; then git clone --quiet --depth=1 https://github.com/PoomSmart/YouQuality.git; fi
+          if [[ "${{ inputs.enable_youpip }}" == "true" ]]; then git clone --quiet --depth=1 https://github.com/PoomSmart/YouPiP.git; fi
+          if [[ "${{ inputs.enable_ytuhd }}" == "true" ]]; then git clone --quiet --depth=1 https://github.com/PoomSmart/YTUHD.git; fi
+          if [[ "${{ inputs.enable_ryd }}" == "true" ]]; then git clone --quiet --depth=1 https://github.com/PoomSmart/Return-YouTube-Dislikes.git; fi
+          if [[ "${{ inputs.enable_demc }}" == "true" ]]; then git clone --quiet --recurse-submodules --depth=1 https://github.com/therealFoxster/DontEatMyContent.git; fi
+          if [[ "${{ inputs.enable_yq }}" == "true" || "${{ inputs.enable_youpip }}" == "true" ]]; then git clone --quiet --depth=1 https://github.com/PoomSmart/YTVideoOverlay.git; fi
+          if [[ "${{ inputs.enable_yq }}" == "true" ]]; then git clone --quiet --depth=1 https://github.com/PoomSmart/YouQuality.git; fi
         env:
           THEOS: ${{ github.workspace }}/theos
 
-      - name: (Optional) Build extra tweaks
+      - name: "(Optional) Build extra tweaks"
         if: ${{ inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_demc }}
         run: |
           set -e
@@ -206,7 +202,6 @@ jobs:
           [[ "${{ inputs.enable_ryd }}" == "true" ]] && build_deb "$GITHUB_WORKSPACE/Return-YouTube-Dislikes" ryd.deb || true
           [[ "${{ inputs.enable_demc }}" == "true" ]] && build_deb "$GITHUB_WORKSPACE/DontEatMyContent" demc.deb || true
           [[ "${{ inputs.enable_yq }}" == "true" ]] && build_deb "$GITHUB_WORKSPACE/YouQuality" yq.deb || true
-          # YTVideoOverlay is a dependency for some tweaks; build if its repo exists
           [[ -d "$GITHUB_WORKSPACE/YTVideoOverlay" ]] && build_deb "$GITHUB_WORKSPACE/YTVideoOverlay" ytvo.deb || true
         env:
           THEOS: ${{ github.workspace }}/theos
@@ -227,15 +222,13 @@ jobs:
           for f in "$GITHUB_WORKSPACE"/*.deb; do
             [[ -f "$f" && "$f" != *"ytplus.deb" ]] && tweaks="$tweaks $f"
           done
-
-          echo "Injecting into youtube.ipa"
+          echo "Injecting tweaks into youtube.ipa"
           echo "Tweaks: $tweaks"
           cyan -i "$GITHUB_WORKSPACE/youtube.ipa" \
                -o "YouTubePlus_${{ inputs.tweak_version }}.ipa" \
                -uwef $tweaks \
                -n "${{ inputs.display_name }}" \
                -b "${{ inputs.bundle_id }}"
-
           echo "Output:"
           ls -lah "YouTubePlus_${{ inputs.tweak_version }}.ipa"
 
