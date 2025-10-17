@@ -87,16 +87,59 @@ jobs:
         with:
           exclude_inputs: bundle_id,display_name,enable_demc,enable_ryd,enable_youpip,enable_yq,enable_ytuhd,info_note,tweak_version
 
-      - name: Download and validate IPA
-        run: |
-          wget "${{ inputs.ipa_url }}" --no-verbose -O ${{ github.workspace }}/youtube.ipa
+- name: Download and validate IPA
+  shell: bash
+  run: |
+    set -euo pipefail
 
-          file_type=$(file --mime-type -b ${{ github.workspace }}/youtube.ipa)
+    # Download (follow redirects, fail on HTTP errors)
+    curl -L --fail --retry 3 --retry-delay 2 \
+      -A "GitHubActions/1.0 (+https://github.com)" \
+      -o "$GITHUB_WORKSPACE/youtube.ipa" \
+      "${{ inputs.ipa_url }}"
 
-          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
-            echo "::error::Validation failed: The downloaded file is not a valid IPA. Detected type: $file_type."
-            exit 1
-          fi
+    echo "Downloaded file info:"
+    ls -lah "$GITHUB_WORKSPACE/youtube.ipa"
+    file "$GITHUB_WORKSPACE/youtube.ipa" || true
+    mime="$(file --mime-type -b "$GITHUB_WORKSPACE/youtube.ipa")"
+
+    # Quick sanity: sometimes you get HTML instead of the real file
+    if [[ "$mime" == "text/html" || "$mime" == "text/plain" ]]; then
+      echo "::error::The URL returned $mime (likely a sign-in wall or bad link), not an IPA. Open the URL in a browser and copy a direct file link."
+      exit 1
+    fi
+
+    # Check zip structure and presence of Payload/
+    if ! unzip -l "$GITHUB_WORKSPACE/youtube.ipa" >/tmp/ziplist.txt 2>/dev/null; then
+      echo "::error::File is not a ZIP/IPA or is corrupted."
+      exit 1
+    fi
+
+    head -n 50 /tmp/ziplist.txt || true
+
+    if ! grep -qE ' Payload/[^/]+\.app/' /tmp/ziplist.txt; then
+      echo "::warning::No Payload/*.app found. Attempting auto-repack if this is a zipped .app…"
+
+      # Try to detect a top-level .app bundle and repack as a proper IPA
+      tmpdir="$(mktemp -d)"
+      unzip -q "$GITHUB_WORKSPACE/youtube.ipa" -d "$tmpdir"
+
+      appdir="$(find "$tmpdir" -maxdepth 2 -type d -name '*.app' | head -n 1 || true)"
+      if [[ -n "${appdir:-}" ]]; then
+        echo "Found app bundle at: $appdir"
+        rpdir="$(mktemp -d)"
+        mkdir -p "$rpdir/Payload"
+        rsync -a "$appdir" "$rpdir/Payload/"
+        (cd "$rpdir" && zip -qry "$GITHUB_WORKSPACE/youtube.ipa" Payload)
+        echo "Repacked as a proper IPA with Payload/."
+      else
+        echo "::error::Invalid IPA: no Payload/ found and no .app bundle to repack. Provide a decrypted device IPA (not a Simulator .app)."
+        exit 1
+      fi
+    fi
+
+    echo "Final IPA structure (first 50 lines):"
+    unzip -l "$GITHUB_WORKSPACE/youtube.ipa" | head -n 50
 
       - name: Install Dependencies
         run: brew install make ldid
