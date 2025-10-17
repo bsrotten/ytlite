@@ -206,14 +206,13 @@ jobs:
         env:
           THEOS: ${{ github.workspace }}/theos
 
-      - name: Final sanity check: IPA has Payload/*.app
+      - name: "Final sanity check: IPA has Payload/*.app"
         run: |
           set -euo pipefail
           if ! unzip -l "$GITHUB_WORKSPACE/youtube.ipa" | grep -qE ' Payload/[^/]+\.app/'; then
             echo "::error::youtube.ipa lacks Payload/*.app — provide a decrypted device IPA (not Simulator)."
             exit 1
           fi
-
       - name: Inject tweaks (no signing; AltStore-ready)
         shell: bash
         run: |
